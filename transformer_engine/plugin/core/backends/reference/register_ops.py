@@ -468,6 +468,48 @@ def register_builtins(registry) -> None:
             vendor=None,
             priority=50,
         ),
+        ##NOTE(malin) add Begin
+        OpImpl(
+            op_name="multi_tensor_compute_scale_and_scale_inv",
+            impl_id="reference.torch",
+            kind=BackendImplKind.REFERENCE,
+            fn=_bind_is_available(backend.multi_tensor_compute_scale_and_scale_inv, is_avail),
+            vendor=None,
+            priority=50,
+        ),
+        OpImpl(
+            op_name="multi_tensor_adam_fp8",
+            impl_id="reference.torch",
+            kind=BackendImplKind.REFERENCE,
+            fn=_bind_is_available(backend.multi_tensor_adam_fp8, is_avail),
+            vendor=None,
+            priority=50,
+        ),
+        OpImpl(
+            op_name="multi_tensor_adam_capturable",
+            impl_id="reference.torch",
+            kind=BackendImplKind.REFERENCE,
+            fn=_bind_is_available(backend.multi_tensor_adam_capturable, is_avail),
+            vendor=None,
+            priority=50,
+        ),
+        OpImpl(
+            op_name="multi_tensor_adam_capturable_master",
+            impl_id="reference.torch",
+            kind=BackendImplKind.REFERENCE,
+            fn=_bind_is_available(backend.multi_tensor_adam_capturable_master, is_avail),
+            vendor=None,
+            priority=50,
+        ),
+        OpImpl(
+            op_name="bulk_overlap_ag_with_external_gemm",
+            impl_id="reference.torch",
+            kind=BackendImplKind.REFERENCE,
+            fn=_bind_is_available(backend.bulk_overlap_ag_with_external_gemm, is_avail),
+            vendor=None,
+            priority=50,
+        ),
+        ##NOTE(malin) add End
         # FlashAttention class getter
         OpImpl(
             op_name="get_flash_attention_class",

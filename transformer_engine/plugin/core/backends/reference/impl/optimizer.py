@@ -12,6 +12,11 @@ __all__ = [
     "multi_tensor_adam_param_remainder_torch",
     "multi_tensor_sgd_torch",
     "multi_tensor_compute_scale_and_scale_inv_torch",
+    ##NOTE(malin) add Begin
+    "multi_tensor_adam_fp8_torch",
+    "multi_tensor_adam_capturable_torch",
+    "multi_tensor_adam_capturable_master_torch",
+    ##NOTE(malin) add End
 ]
 
 
@@ -392,3 +397,246 @@ def multi_tensor_compute_scale_and_scale_inv_torch(
         # Update scale and scale_inv
         scale.copy_(computed_scale)
         scale_inv.copy_(1.0 / computed_scale)
+
+
+##NOTE(malin) add Begin
+def _torch_fp8_dtype_from_te(te_fp8_dtype: int):
+    """Map TE DType int (kFloat8E4M3, kFloat8E5M2) to torch.float8_* (PyTorch 2.4+)."""
+    # transformer_engine.plugin.core.ops.DType
+    k_float8_e4m3 = 7
+    k_float8_e5m2 = 8
+    if int(te_fp8_dtype) == k_float8_e4m3:
+        dt = getattr(torch, "float8_e4m3fn", None)
+        if dt is not None:
+            return dt
+    elif int(te_fp8_dtype) == k_float8_e5m2:
+        dt = getattr(torch, "float8_e5m2", None)
+        if dt is not None:
+            return dt
+    raise RuntimeError(
+        "multi_tensor_adam_fp8 (reference backend) needs PyTorch 2.4+ float8 types "
+        f"(float8_e4m3fn / float8_e5m2) for fp8_dtype={te_fp8_dtype}. "
+        "Alternatively build TE with CUDA so transformer_engine_torch_nv provides this op."
+    )
+
+
+def multi_tensor_adam_fp8_torch(
+    chunk_size: int,
+    noop_flag: torch.Tensor,
+    tensor_lists: List[List[torch.Tensor]],
+    lr: float,
+    beta1: float,
+    beta2: float,
+    epsilon: float,
+    step: int,
+    mode: int,
+    bias_correction: int,
+    weight_decay: float,
+    fp8_dtype: int,
+) -> None:
+    """
+    Adam for FP8 primary weights + FP32 master (matches CUDA ``AdamFunctorMaster`` logic).
+    tensor_lists: [g, p_fp8, m, v, p_master, scale, amax, scale_inv] (see ``adam.cu``).
+    """
+    if noop_flag.item() != 0:
+        return
+    if len(tensor_lists) != 8:
+        raise ValueError(
+            "tensor_lists should contain [g, p_fp8, m, v, p_master, scale, amax, scale_inv]"
+        )
+    (
+        grads,
+        p_fp8s,
+        exp_avgs,
+        exp_avg_sqs,
+        p_masters,
+        scales,
+        amaxes,
+        scale_invs,
+    ) = tensor_lists
+    n = len(grads)
+    if not (
+        len(p_fp8s)
+        == len(exp_avgs)
+        == len(exp_avg_sqs)
+        == len(p_masters)
+        == len(scales)
+        == len(amaxes)
+        == len(scale_invs)
+        == n
+    ):
+        raise ValueError("All tensor lists must have the same length")
+    if bias_correction:
+        bias_correction1 = 1 - beta1**step
+        bias_correction2 = 1 - beta2**step
+    else:
+        bias_correction1 = 1.0
+        bias_correction2 = 1.0
+    torch_fp8 = _torch_fp8_dtype_from_te(fp8_dtype)
+    for grad, p_fp8, m, v, p_master, scale, amax, scale_inv in zip(
+        grads, p_fp8s, exp_avgs, exp_avg_sqs, p_masters, scales, amaxes, scale_invs
+    ):
+        g = grad.float()
+        p_m = p_master.float()
+        if mode == 0:
+            g = g + weight_decay * p_m
+            m.mul_(beta1).add_(g, alpha=1 - beta1)
+            v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+            m_corr = m / bias_correction1
+            v_corr = v / bias_correction2
+            denom = v_corr.sqrt().add_(epsilon)
+            update = m_corr / denom
+            p_master.add_(update, alpha=-lr)
+        else:
+            m.mul_(beta1).add_(g, alpha=1 - beta1)
+            v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+            m_corr = m / bias_correction1
+            v_corr = v / bias_correction2
+            denom = v_corr.sqrt().add_(epsilon)
+            update = (m_corr / denom) + (weight_decay * p_m)
+            p_master.add_(update, alpha=-lr)
+        # FP8 primary storage: CUDA uses cast(p_master * scale) with quantizer scale
+        scaled = p_master.float() * scale.float()
+        fp8_vals = scaled.to(torch_fp8)
+        if p_fp8.dtype == torch.uint8:
+            p_fp8.copy_(fp8_vals.view(torch.uint8))
+        else:
+            p_fp8.copy_(fp8_vals)
+        chunk_max = p_master.abs().max()
+        #if amax.numel() == 1:
+        #    amax.copy_(torch.maximum(amax, chunk_max))
+        #else:
+        #    amax.copy_(torch.maximum(amax, chunk_max.expand_as(amax)))
+        amax.copy_(torch.maximum(amax, chunk_max))  ## add new
+        if scale_inv.numel() == 1 and scale.numel() == 1:
+            scale_inv.copy_(1.0 / scale)
+        elif scale_inv.shape == scale.shape:
+            scale_inv.copy_(1.0 / scale)
+
+
+def multi_tensor_adam_capturable_torch(
+    chunk_size: int,
+    noop_flag: torch.Tensor,
+    tensor_lists: List[List[torch.Tensor]],
+    lr: torch.Tensor,
+    beta1: float,
+    beta2: float,
+    epsilon: float,
+    step: torch.Tensor,
+    mode: int,
+    bias_correction: int,
+    weight_decay: float,
+    inv_scale: torch.Tensor,
+) -> None:
+    """
+    AMP-capturable Adam (grad scaler): unscale grads with ``inv_scale``, then Adam update.
+    tensor_lists: [grads, params, exp_avg, exp_avg_sq] — same dtypes as CUDA
+    ``AdamCapturableFunctor`` (``adam.cu``).
+    """
+    if noop_flag.item() != 0:
+        return
+    if len(tensor_lists) != 4:
+        raise ValueError("tensor_lists should contain [grads, params, exp_avgs, exp_avg_sqs]")
+    grads, params, exp_avgs, exp_avg_sqs = tensor_lists
+    if not (len(params) == len(grads) == len(exp_avgs) == len(exp_avg_sqs)):
+        raise ValueError("All tensor lists must have the same length")
+    lr_f = float(lr.reshape(-1)[0].item())
+    step_i = int(step.reshape(-1)[0].item())
+    #isc = inv_scale.to(dtype=torch.float32).reshape(-1)[0]
+    if bias_correction:
+        bias_correction1 = 1 - beta1**step_i
+        bias_correction2 = 1 - beta2**step_i
+    else:
+        bias_correction1 = 1.0
+        bias_correction2 = 1.0
+    for grad, param, exp_avg, exp_avg_sq in zip(grads, params, exp_avgs, exp_avg_sqs):
+        #grad.mul_(isc.to(device=grad.device, dtype=grad.dtype))
+        isc = inv_scale.to(device=grad.device, dtype=torch.float32).reshape(-1)[0]  ## add new
+        grad.mul_(isc.to(dtype=grad.dtype))  ## add new
+        g = grad.float()
+        p = param.float()
+        if mode == 0:
+            g = g + weight_decay * p
+            exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+            m_corr = exp_avg / bias_correction1
+            v_corr = exp_avg_sq / bias_correction2
+            denom = v_corr.sqrt().add_(epsilon)
+            update = m_corr / denom
+            param.add_(update, alpha=-lr_f)
+        else:
+            exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+            m_corr = exp_avg / bias_correction1
+            v_corr = exp_avg_sq / bias_correction2
+            denom = v_corr.sqrt().add_(epsilon)
+            update = (m_corr / denom) + (weight_decay * p)
+            param.add_(update, alpha=-lr_f)
+
+
+def multi_tensor_adam_capturable_master_torch(
+    chunk_size: int,
+    noop_flag: torch.Tensor,
+    tensor_lists: List[List[torch.Tensor]],
+    lr: torch.Tensor,
+    beta1: float,
+    beta2: float,
+    epsilon: float,
+    step: torch.Tensor,
+    mode: int,
+    bias_correction: int,
+    weight_decay: float,
+    inv_scale: torch.Tensor,
+) -> None:
+    """
+    Capturable Adam with FP16/BF16 params and FP32 master weights.
+    tensor_lists: [grads, params_low, exp_avg, exp_avg_sq, master_param] — see
+    ``AdamCapturableMasterFunctor`` in ``adam.cu``.
+    """
+    if noop_flag.item() != 0:
+        return
+    if len(tensor_lists) != 5:
+        raise ValueError(
+            "tensor_lists should contain [grads, params, exp_avgs, exp_avg_sqs, master_params]"
+        )
+    grads, params, exp_avgs, exp_avg_sqs, p_masters = tensor_lists
+    if not (
+        len(params) == len(grads) == len(exp_avgs) == len(exp_avg_sqs) == len(p_masters)
+    ):
+        raise ValueError("All tensor lists must have the same length")
+    lr_f = float(lr.reshape(-1)[0].item())
+    step_i = int(step.reshape(-1)[0].item())
+    #isc = inv_scale.to(dtype=torch.float32).reshape(-1)[0]
+    if bias_correction:
+        bias_correction1 = 1 - beta1**step_i
+        bias_correction2 = 1 - beta2**step_i
+    else:
+        bias_correction1 = 1.0
+        bias_correction2 = 1.0
+    for grad, param, exp_avg, exp_avg_sq, p_master in zip(
+        grads, params, exp_avgs, exp_avg_sqs, p_masters
+    ):
+        #grad.mul_(isc.to(device=grad.device, dtype=grad.dtype))
+        isc = inv_scale.to(device=grad.device, dtype=torch.float32).reshape(-1)[0]  ## add new
+        grad.mul_(isc.to(dtype=grad.dtype))  ## add new
+        g = grad.float()
+        p_m = p_master.float()
+        if mode == 0:
+            g = g + weight_decay * p_m
+            exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+            m_corr = exp_avg / bias_correction1
+            v_corr = exp_avg_sq / bias_correction2
+            denom = v_corr.sqrt().add_(epsilon)
+            update = m_corr / denom
+            p_master.add_(update, alpha=-lr_f)
+        else:
+            exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+            m_corr = exp_avg / bias_correction1
+            v_corr = exp_avg_sq / bias_correction2
+            denom = v_corr.sqrt().add_(epsilon)
+            update = (m_corr / denom) + (weight_decay * p_m)
+            p_master.add_(update, alpha=-lr_f)
+        param.copy_(p_master.to(dtype=param.dtype))
+##NOTE(malin) add End

@@ -57,6 +57,9 @@ from .optimizer import (
     multi_tensor_adam_param_remainder_torch,
     multi_tensor_sgd_torch,
     multi_tensor_compute_scale_and_scale_inv_torch,
+    multi_tensor_adam_fp8_torch,  ##NOTE(malin) add
+    multi_tensor_adam_capturable_torch,  ##NOTE(malin) add
+    multi_tensor_adam_capturable_master_torch,  ##NOTE(malin) add
 )
 
 __all__ = [
@@ -108,4 +111,7 @@ __all__ = [
     "multi_tensor_adam_param_remainder_torch",
     "multi_tensor_sgd_torch",
     "multi_tensor_compute_scale_and_scale_inv_torch",
+    "multi_tensor_adam_fp8_torch",  ##NOTE(malin) add
+    "multi_tensor_adam_capturable_torch",  ##NOTE(malin) add
+    "multi_tensor_adam_capturable_master_torch", ##NOTE(malin) add
 ]
