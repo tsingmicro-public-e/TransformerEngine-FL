@@ -29,6 +29,9 @@ class TXDABackend(TEFLBackendBase):
     def check_available() -> bool:
         return _check_txda_available()
 
+    def __init__(self):
+        self._tex = None
+
     def is_available(self) -> bool:
         return _check_txda_available()
 
