@@ -11,11 +11,21 @@ import sys
 from functools import wraps
 import math
 
+if os.environ.get("PLATFORM") == "ascend":
+    sys.path.insert(
+        0,
+        os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../..", "plugin", "backend", "npu")
+        ),
+    )
+    from npu_patch import apply_ascend_npu_patch
+
+    apply_ascend_npu_patch()
+
 import transformer_engine.pytorch as te
 import torch
 from torch import nn
 import torch.distributed as dist
-import transformer_engine_torch as tex
 from transformer_engine.common.recipe import (
     MXFP8BlockScaling,
     DelayedScaling,
@@ -107,6 +117,7 @@ def main(argv=None, namespace=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("-l", "--layer-type", type=str)
     parser.add_argument("--quantization", type=str, default=None)
+    parser.add_argument("--test-suite", choices=("full", "ascend_smoke"), default="full")
     args = parser.parse_args(argv, namespace)
 
     # Quantization scheme
@@ -125,15 +136,18 @@ def main(argv=None, namespace=None):
         BATCH_SIZE = 128
         HIDDEN_SIZE = 512
 
-    test_dict = [
-        test_quantizer,
-        test_quantized_all_gather,
-        test_linear,
-        test_layernorm,
-        test_layernorm_linear,
-        test_layernorm_mlp,
-        test_transformer_layer,
-    ]
+    if args.test_suite == "ascend_smoke":
+        test_dict = [test_ascend_distributed_numerics_subset]
+    else:
+        test_dict = [
+            test_quantizer,
+            test_quantized_all_gather,
+            test_linear,
+            test_layernorm,
+            test_layernorm_linear,
+            test_layernorm_mlp,
+            test_transformer_layer,
+        ]
 
     for test in test_dict:
         test()
@@ -399,7 +413,7 @@ def _test_quantizer(input_dtype, fp8_dtype):
 
     Args:
         input_dtype (torch.dtype): The data type of the input.
-        fp8_dtype (tex.DType): The data type of the fp8.
+        fp8_dtype (te.DType): The data type of the fp8.
     """
 
     M, N = WORLD_SIZE * BATCH_SIZE, HIDDEN_SIZE
@@ -443,7 +457,7 @@ def test_quantizer():
         return
 
     input_dtypes = [torch.float32, torch.bfloat16]
-    fp8_dtypes = [tex.DType.kFloat8E4M3, tex.DType.kFloat8E5M2]
+    fp8_dtypes = [te.DType.kFloat8E4M3, te.DType.kFloat8E5M2]
 
     for input_dtype in input_dtypes:
         for fp8_dtype in fp8_dtypes:
@@ -514,7 +528,7 @@ def _test_quantized_all_gather(input_dtype, low_precision_dtype, quantizer_cls):
 
     Args:
         input_dtype (torch.dtype): The data type of the input.
-        low_precision_dtype (tex.DType): The data type of the low precision, can be fp4 or fp8.
+        low_precision_dtype (te.DType): The data type of the low precision, can be fp4 or fp8.
     """
 
     M, N = WORLD_SIZE * BATCH_SIZE, HIDDEN_SIZE // 2
@@ -623,8 +637,8 @@ def test_quantized_all_gather():
         return
 
     input_dtypes = [torch.bfloat16]
-    fp4_dtype = [tex.DType.kFloat4E2M1]
-    fp8_dtype = [tex.DType.kFloat8E4M3, tex.DType.kFloat8E5M2]
+    fp4_dtype = [te.DType.kFloat4E2M1]
+    fp8_dtype = [te.DType.kFloat8E4M3, te.DType.kFloat8E5M2]
     quantizer_cls_nvfp4 = [NVFP4Quantizer]
     # add FP8 quantizers if needed
     quantizer_cls_fp8 = []
@@ -1044,6 +1058,11 @@ def test_layernorm_mlp():
         for set_parallel_mode in [True]:
             for sequence_parallel in [False, True]:
                 _test_layernorm_mlp(set_parallel_mode, sequence_parallel, **kwargs)
+
+
+def test_ascend_distributed_numerics_subset():
+    """Run Ascend-compatible distributed numerics without CUDA-only paths."""
+    _test_linear("column", False)
 
 
 ############################################
